@@ -41,13 +41,13 @@
 
 #include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "ceres/evaluator.h"
 #include "ceres/function_sample.h"
 #include "ceres/internal/eigen.h"
 #include "ceres/map_util.h"
 #include "ceres/polynomial.h"
-#include "ceres/stringprintf.h"
-#include "ceres/wall_time.h"
 
 namespace ceres::internal {
 
@@ -79,9 +79,9 @@ std::unique_ptr<LineSearch> LineSearch::Create(
     case ceres::WOLFE:
       return std::make_unique<WolfeLineSearch>(options);
     default:
-      *error = std::string("Invalid line search algorithm type: ") +
-               LineSearchTypeToString(line_search_type) +
-               std::string(", unable to create line search.");
+      *error = absl::StrCat("Invalid line search algorithm type: ",
+                            LineSearchTypeToString(line_search_type),
+                            ", unable to create line search.");
   }
   return nullptr;
 }
@@ -90,9 +90,7 @@ LineSearchFunction::LineSearchFunction(Evaluator* evaluator)
     : evaluator_(evaluator),
       position_(evaluator->NumParameters()),
       direction_(evaluator->NumEffectiveParameters()),
-      scaled_direction_(evaluator->NumEffectiveParameters()),
-      initial_evaluator_residual_time_in_seconds(0.0),
-      initial_evaluator_jacobian_time_in_seconds(0.0) {}
+      scaled_direction_(evaluator->NumEffectiveParameters()) {}
 
 void LineSearchFunction::Init(const Vector& position, const Vector& direction) {
   position_ = position;
@@ -151,57 +149,56 @@ void LineSearchFunction::ResetTimeStatistics() {
   const std::map<std::string, CallStatistics> evaluator_statistics =
       evaluator_->Statistics();
 
-  initial_evaluator_residual_time_in_seconds =
+  initial_evaluator_residual_time =
       FindWithDefault(
           evaluator_statistics, "Evaluator::Residual", CallStatistics())
           .time;
-  initial_evaluator_jacobian_time_in_seconds =
+  initial_evaluator_jacobian_time =
       FindWithDefault(
           evaluator_statistics, "Evaluator::Jacobian", CallStatistics())
           .time;
 }
 
 void LineSearchFunction::TimeStatistics(
-    double* cost_evaluation_time_in_seconds,
-    double* gradient_evaluation_time_in_seconds) const {
+    absl::Duration* cost_evaluation_time,
+    absl::Duration* gradient_evaluation_time) const {
   const std::map<std::string, CallStatistics> evaluator_time_statistics =
       evaluator_->Statistics();
-  *cost_evaluation_time_in_seconds =
+  *cost_evaluation_time =
       FindWithDefault(
           evaluator_time_statistics, "Evaluator::Residual", CallStatistics())
           .time -
-      initial_evaluator_residual_time_in_seconds;
+      initial_evaluator_residual_time;
   // Strictly speaking this will slightly underestimate the time spent
   // evaluating the gradient of the line search univariate cost function as it
   // does not count the time spent performing the dot product with the direction
   // vector.  However, this will typically be small by comparison, and also
   // allows direct subtraction of the timing information from the totals for
   // the evaluator returned in the solver summary.
-  *gradient_evaluation_time_in_seconds =
+  *gradient_evaluation_time =
       FindWithDefault(
           evaluator_time_statistics, "Evaluator::Jacobian", CallStatistics())
           .time -
-      initial_evaluator_jacobian_time_in_seconds;
+      initial_evaluator_jacobian_time;
 }
 
 void LineSearch::Search(double step_size_estimate,
                         double initial_cost,
                         double initial_gradient,
                         Summary* summary) const {
-  const double start_time = WallTimeInSeconds();
+  const absl::Time start_time = absl::Now();
   CHECK(summary != nullptr);
   *summary = LineSearch::Summary();
 
-  summary->cost_evaluation_time_in_seconds = 0.0;
-  summary->gradient_evaluation_time_in_seconds = 0.0;
-  summary->polynomial_minimization_time_in_seconds = 0.0;
+  summary->cost_evaluation_time = absl::ZeroDuration();
+  summary->gradient_evaluation_time = absl::ZeroDuration();
+  summary->polynomial_minimization_time = absl::ZeroDuration();
   options().function->ResetTimeStatistics();
   this->DoSearch(step_size_estimate, initial_cost, initial_gradient, summary);
-  options().function->TimeStatistics(
-      &summary->cost_evaluation_time_in_seconds,
-      &summary->gradient_evaluation_time_in_seconds);
+  options().function->TimeStatistics(&summary->cost_evaluation_time,
+                                     &summary->gradient_evaluation_time);
 
-  summary->total_time_in_seconds = WallTimeInSeconds() - start_time;
+  summary->total_time = absl::Now() - start_time;
 }
 
 // Returns step_size \in [min_step_size, max_step_size] which minimizes the
@@ -317,7 +314,7 @@ void ArmijoLineSearch::DoSearch(const double step_size_estimate,
     // point is not large enough to satisfy the sufficient decrease condition.
     ++summary->num_iterations;
     if (summary->num_iterations >= options().max_num_iterations) {
-      summary->error = StringPrintf(
+      summary->error = absl::StrFormat(
           "Line search failed: Armijo failed to find a point "
           "satisfying the sufficient decrease condition within "
           "specified max_num_iterations: %d.",
@@ -328,7 +325,7 @@ void ArmijoLineSearch::DoSearch(const double step_size_estimate,
       return;
     }
 
-    const double polynomial_minimization_start_time = WallTimeInSeconds();
+    const absl::Time polynomial_minimization_start_time = absl::Now();
     const double step_size = this->InterpolatingPolynomialMinimizingStepSize(
         options().interpolation_type,
         initial_position,
@@ -336,11 +333,11 @@ void ArmijoLineSearch::DoSearch(const double step_size_estimate,
         current,
         (options().max_step_contraction * current.x),
         (options().min_step_contraction * current.x));
-    summary->polynomial_minimization_time_in_seconds +=
-        (WallTimeInSeconds() - polynomial_minimization_start_time);
+    summary->polynomial_minimization_time +=
+        (absl::Now() - polynomial_minimization_start_time);
 
     if (step_size * descent_direction_max_norm < options().min_step_size) {
-      summary->error = StringPrintf(
+      summary->error = absl::StrFormat(
           "Line search failed: step_size too small: %.5e "
           "with descent_direction_max_norm: %.5e.",
           step_size,
@@ -604,7 +601,7 @@ bool WolfeLineSearch::BracketingPhase(const FunctionSample& initial_position,
       // Check num iterations bound here so that we always evaluate the
       // max_num_iterations-th iteration against all conditions, and
       // then perform no additional (unused) evaluations.
-      summary->error = StringPrintf(
+      summary->error = absl::StrFormat(
           "Line search failed: Wolfe bracketing phase failed to "
           "find a point satisfying strong Wolfe conditions, or a "
           "bracket containing such a point within specified "
@@ -649,7 +646,7 @@ bool WolfeLineSearch::BracketingPhase(const FunctionSample& initial_position,
     const FunctionSample unused_previous;
     DCHECK(!unused_previous.value_is_valid);
     // Contracts step size if f(current) is not valid.
-    const double polynomial_minimization_start_time = WallTimeInSeconds();
+    const absl::Time polynomial_minimization_start_time = absl::Now();
     const double step_size = this->InterpolatingPolynomialMinimizingStepSize(
         options().interpolation_type,
         previous,
@@ -657,10 +654,10 @@ bool WolfeLineSearch::BracketingPhase(const FunctionSample& initial_position,
         current,
         min_step_size,
         max_step_size);
-    summary->polynomial_minimization_time_in_seconds +=
-        (WallTimeInSeconds() - polynomial_minimization_start_time);
+    summary->polynomial_minimization_time +=
+        (absl::Now() - polynomial_minimization_start_time);
     if (step_size * descent_direction_max_norm < options().min_step_size) {
-      summary->error = StringPrintf(
+      summary->error = absl::StrFormat(
           "Line search failed: step_size too small: %.5e "
           "with descent_direction_max_norm: %.5e",
           step_size,
@@ -736,7 +733,7 @@ bool WolfeLineSearch::ZoomPhase(const FunctionSample& initial_position,
     // returns inconsistent gradient values relative to the function values,
     // we do not CHECK_LT(), but we do stop processing and return an invalid
     // value.
-    summary->error = StringPrintf(
+    summary->error = absl::StrFormat(
         "Line search failed: Wolfe zoom phase passed a bracket "
         "which does not satisfy: bracket_low.gradient * "
         "(bracket_high.x - bracket_low.x) < 0 [%.8e !< 0] "
@@ -744,9 +741,9 @@ bool WolfeLineSearch::ZoomPhase(const FunctionSample& initial_position,
         " %s, the most likely cause of which is the cost function "
         "returning inconsistent gradient & function values.",
         bracket_low.gradient * (bracket_high.x - bracket_low.x),
-        initial_position.ToDebugString().c_str(),
-        bracket_low.ToDebugString().c_str(),
-        bracket_high.ToDebugString().c_str());
+        initial_position.ToDebugString(),
+        bracket_low.ToDebugString(),
+        bracket_high.ToDebugString());
     if (!options().is_silent) {
       LOG(WARNING) << summary->error;
     }
@@ -763,7 +760,7 @@ bool WolfeLineSearch::ZoomPhase(const FunctionSample& initial_position,
     // not satisfy the Wolfe condition.
     *solution = bracket_low;
     if (summary->num_iterations >= options().max_num_iterations) {
-      summary->error = StringPrintf(
+      summary->error = absl::StrFormat(
           "Line search failed: Wolfe zoom phase failed to "
           "find a point satisfying strong Wolfe conditions "
           "within specified max_num_iterations: %d, "
@@ -779,7 +776,7 @@ bool WolfeLineSearch::ZoomPhase(const FunctionSample& initial_position,
         options().min_step_size) {
       // Bracket width has been reduced below tolerance, and no point satisfying
       // the strong Wolfe conditions has been found.
-      summary->error = StringPrintf(
+      summary->error = absl::StrFormat(
           "Line search failed: Wolfe zoom bracket width: %.5e "
           "too small with descent_direction_max_norm: %.5e.",
           fabs(bracket_high.x - bracket_low.x),
@@ -803,7 +800,7 @@ bool WolfeLineSearch::ZoomPhase(const FunctionSample& initial_position,
     // value that will therefore be ignored.
     const FunctionSample unused_previous;
     DCHECK(!unused_previous.value_is_valid);
-    const double polynomial_minimization_start_time = WallTimeInSeconds();
+    const absl::Time polynomial_minimization_start_time = absl::Now();
     const double step_size = this->InterpolatingPolynomialMinimizingStepSize(
         options().interpolation_type,
         lower_bound_step,
@@ -811,8 +808,8 @@ bool WolfeLineSearch::ZoomPhase(const FunctionSample& initial_position,
         upper_bound_step,
         lower_bound_step.x,
         upper_bound_step.x);
-    summary->polynomial_minimization_time_in_seconds +=
-        (WallTimeInSeconds() - polynomial_minimization_start_time);
+    summary->polynomial_minimization_time +=
+        (absl::Now() - polynomial_minimization_start_time);
     // No check on magnitude of step size being too small here as it is
     // lower-bounded by the initial bracket start point, which was valid.
     //
@@ -830,7 +827,7 @@ bool WolfeLineSearch::ZoomPhase(const FunctionSample& initial_position,
     const bool kEvaluateGradient = true;
     function->Evaluate(step_size, kEvaluateGradient, solution);
     if (!solution->value_is_valid || !solution->gradient_is_valid) {
-      summary->error = StringPrintf(
+      summary->error = absl::StrFormat(
           "Line search failed: Wolfe Zoom phase found "
           "step_size: %.5e, for which function is invalid, "
           "between low_step: %.5e and high_step: %.5e "

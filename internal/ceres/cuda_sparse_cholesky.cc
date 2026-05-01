@@ -192,8 +192,8 @@ class CERES_NO_EXPORT CudaSparseCholeskyImpl final : public SparseCholesky {
 
   CudaSparseCholeskyImpl(ContextImpl* context)
       : context_(context),
-        lhs_cols_d_(context_),
         lhs_rows_d_(context_),
+        lhs_cols_d_(context_),
         lhs_values_d_(context_),
         rhs_d_(context_),
         x_d_(context_) {}
